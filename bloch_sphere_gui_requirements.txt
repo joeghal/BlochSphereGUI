@@ -1,0 +1,4 @@
+numpy
+matplotlib
+cudaq
+# tkinter is part of the Python standard library for most systems
