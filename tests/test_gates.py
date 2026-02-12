@@ -1,24 +1,32 @@
 import numpy as np
+import cudaq
 
-# define gates
-H = (1.0 / np.sqrt(2.0)) * np.array([[1, 1], [1, -1]], dtype=complex)
-X = np.array([[0, 1], [1, 0]], dtype=complex)
-S = np.array([[1, 0], [0, 1j]], dtype=complex)
 
-zero = np.array([1.0+0j, 0.0+0j])
+# helper that builds a trivial kernel applying a single named gate
+# and returns the state vector for |0> after the gate.
+def state_after(gate_fn):
+    @cudaq.kernel
+    def circ():
+        q = cudaq.qubit()
+        gate_fn(q)
 
-h_zero = H @ zero
-x_zero = X @ zero
-s_zero = S @ zero
+    return np.array(cudaq.get_state(circ), dtype=complex)
 
-print('H|0> =', np.round(h_zero, 6))
-print('X|0> =', np.round(x_zero, 6))
-print('S|0> =', np.round(s_zero, 6))
 
-# expected
-exp_h = np.array([1/np.sqrt(2), 1/np.sqrt(2)])
-assert np.allclose(h_zero, exp_h)
-assert np.allclose(x_zero, np.array([0,1]))
-assert np.allclose(s_zero, np.array([1,0]))
+def test_h_gate():
+    # Hadamard sends |0> -> (|0>+|1>)/√2
+    state = state_after(lambda q: cudaq.h(q))
+    expected = np.array([1/np.sqrt(2), 1/np.sqrt(2)], dtype=complex)
+    assert np.allclose(state, expected)
 
-print('All gate tests passed')
+
+def test_x_gate():
+    state = state_after(lambda q: cudaq.x(q))
+    expected = np.array([0, 1], dtype=complex)
+    assert np.allclose(state, expected)
+
+
+def test_s_gate():
+    state = state_after(lambda q: cudaq.s(q))
+    expected = np.array([1, 0], dtype=complex)
+    assert np.allclose(state, expected)
