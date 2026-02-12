@@ -1,4 +1,5 @@
 numpy
 matplotlib
 cudaq
+pytest
 # tkinter is part of the Python standard library for most systems

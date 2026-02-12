@@ -56,15 +56,8 @@ imports the `BlochSphereGUI` class and runs it.  This makes it easy to
 write tests, use the GUI logic from other scripts, or convert the
 package into a distributable project later.
 
-To run the unit tests (which exercise CUDA-Q kernels):
-
-```sh
-pytest
-```
-
-The test suite is located in `tests/test_gates.py` and uses the
-`cudaq` API rather than plain NumPy so that the back end is tested as
-well.
+(No automated tests are provided in this repository.  All
+behaviour can be exercised manually via the GUI.)
 ## Credits
 
 * **Author**: Joe Ghal – developer and maintainer of this demo.
