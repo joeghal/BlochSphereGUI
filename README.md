@@ -4,10 +4,9 @@ A simple interactive application for visualizing single-qubit states on
 the Bloch sphere.  Users can perform RX/RY/RZ rotations with sliders,
 enter arbitrary state vectors, and apply common quantum gates.  The
 interface is built with `tkinter` and `matplotlib` while the underlying
-quantum evolution is computed using [CUDA-Q](https://github.com/quantum
-/).
+quantum evolution is computed using [CUDA-Q](https://github.com/NVIDIA/cuda-quantum).
 
-![Animation placeholder](docs/screenshots/gui_example.gif)
+![Animation placeholder](demo.gif)
 
 ## Features
 
