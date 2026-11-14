@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 from tkinter import Scale, Frame, Label
 import numpy as np
@@ -5,14 +6,179 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
-import cudaq
+
+try:
+    import cudaq
+except Exception:  # pragma: no cover - exercised when the package is absent
+    cudaq = None
+
+
+# Name registered with CUDA-Q for arbitrary single-qubit unitaries.
+_CUDAQ_CUSTOM_GATE = "bloch_apply_unitary"
+
+_GPU_TARGET_MARKERS = ("nvidia", "custatevec")
+
+
+def bloch_coordinates(state):
+    """Return Bloch (x, y, z) for a single-qubit state vector."""
+    state = np.array(state, dtype=complex)
+    norm = np.linalg.norm(state)
+    if norm < 1e-15:
+        return 0.0, 0.0, 0.0
+    state = state / norm
+    a0 = state[0]
+    a1 = state[1]
+    x = 2 * np.real(np.conj(a0) * a1)
+    y = 2 * np.imag(np.conj(a0) * a1)
+    z = np.abs(a0) ** 2 - np.abs(a1) ** 2
+    return float(x), float(y), float(z)
+
+
+def state_from_slider_angles(nx, ny, nz):
+    """State produced by RX(nx·π), RY(ny·π), RZ(nz·π) applied to |0⟩.
+
+    Gate order matches the CUDA-Q slider kernel: later gates act on the left,
+    so the unitary is RZ @ RY @ RX.
+    """
+    a = float(nx) * np.pi
+    b = float(ny) * np.pi
+    c = float(nz) * np.pi
+    cA = np.cos(a / 2.0)
+    sA = np.sin(a / 2.0)
+    RX = np.array([[cA, -1j * sA], [-1j * sA, cA]], dtype=complex)
+    cB = np.cos(b / 2.0)
+    sB = np.sin(b / 2.0)
+    RY = np.array([[cB, -sB], [sB, cB]], dtype=complex)
+    RZ = np.array(
+        [[np.exp(-1j * c / 2.0), 0], [0, np.exp(1j * c / 2.0)]],
+        dtype=complex,
+    )
+    vec = RZ @ RY @ RX @ np.array([1.0 + 0j, 0.0 + 0j], dtype=complex)
+    return vec / np.linalg.norm(vec)
+
+
+def named_gate_matrix(name):
+    """NumPy matrix for a named single-qubit gate, or None if not a matrix gate."""
+    name = name.upper()
+    X = np.array([[0, 1], [1, 0]], dtype=complex)
+    Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    Z = np.array([[1, 0], [0, -1]], dtype=complex)
+    H = (1.0 / np.sqrt(2.0)) * np.array([[1, 1], [1, -1]], dtype=complex)
+    S = np.array([[1, 0], [0, 1j]], dtype=complex)
+    T = np.array([[1, 0], [0, np.exp(1j * np.pi / 4)]], dtype=complex)
+    RX90 = np.array(
+        [
+            [np.cos(np.pi / 4), -1j * np.sin(np.pi / 4)],
+            [-1j * np.sin(np.pi / 4), np.cos(np.pi / 4)],
+        ],
+        dtype=complex,
+    )
+    RY90 = np.array(
+        [
+            [np.cos(np.pi / 4), -np.sin(np.pi / 4)],
+            [np.sin(np.pi / 4), np.cos(np.pi / 4)],
+        ],
+        dtype=complex,
+    )
+    RZ90 = np.array(
+        [[np.exp(-1j * np.pi / 4), 0], [0, np.exp(1j * np.pi / 4)]],
+        dtype=complex,
+    )
+    return {
+        "H": H,
+        "X": X,
+        "Y": Y,
+        "Z": Z,
+        "S": S,
+        "T": T,
+        "RX90": RX90,
+        "RY90": RY90,
+        "RZ90": RZ90,
+    }.get(name)
+
+
+def _target_needs_gpu(target) -> bool:
+    name = str(getattr(target, "name", "") or "").lower()
+    simulator = str(getattr(target, "simulator", "") or "").lower()
+    blob = f"{name} {simulator}"
+    return any(marker in blob for marker in _GPU_TARGET_MARKERS)
+
+
+def _cudaq_kernel_runs() -> bool:
+    """Return True when the active CUDA-Q target can execute a 1-qubit kernel."""
+    if cudaq is None:
+        return False
+    try:
+        @cudaq.kernel
+        def _ping():
+            q = cudaq.qubit()
+            h(q)
+
+        cudaq.get_state(_ping)
+        return True
+    except Exception:
+        return False
+
+
+def select_cudaq_target():
+    """Choose a CUDA-Q target that can run kernels.
+
+    An explicit ``CUDAQ_DEFAULT_SIMULATOR`` is tried first. When the active
+    target needs a GPU and none is usable (or a kernel fails), fall back to
+    the ``qpp-cpu`` simulator. Returns the target name, or None when CUDA-Q
+    cannot execute.
+    """
+    if cudaq is None:
+        return None
+
+    requested = os.environ.get("CUDAQ_DEFAULT_SIMULATOR", "").strip()
+    if requested:
+        try:
+            cudaq.set_target(requested)
+        except Exception:
+            pass
+
+    def _usable(target_name_hint=None):
+        try:
+            target = cudaq.get_target()
+        except Exception:
+            return False
+        if target_name_hint and getattr(target, "name", None) != target_name_hint:
+            return False
+        gpus = 0
+        try:
+            gpus = int(cudaq.num_available_gpus())
+        except Exception:
+            gpus = 0
+        if gpus <= 0 and _target_needs_gpu(target):
+            return False
+        return _cudaq_kernel_runs()
+
+    if _usable():
+        try:
+            return cudaq.get_target().name
+        except Exception:
+            return requested or "qpp-cpu"
+
+    try:
+        cudaq.set_target("qpp-cpu")
+    except Exception:
+        return None
+    if _usable("qpp-cpu") or _cudaq_kernel_runs():
+        try:
+            return cudaq.get_target().name
+        except Exception:
+            return "qpp-cpu"
+    return None
 
 
 class BlochSphereGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Bloch Sphere Rotations - CUDA-Q")
-        self.root.geometry("900x600")
+        # Tall enough that the state-information block (including Bloch y and z)
+        # sits inside the window instead of being clipped by the control canvas.
+        self.root.geometry("900x700")
         
         # Create main frame
         main_frame = Frame(root)
@@ -21,6 +187,7 @@ class BlochSphereGUI:
         # Create a scrollable control panel on the left using a Canvas
         control_canvas = tk.Canvas(main_frame, width=360)
         control_canvas.pack(side=tk.LEFT, fill=tk.Y, padx=(0,5))
+        self.control_canvas = control_canvas
 
         # Vertical slider to show there is more content and to control scrolling
         def _on_menu_slider(val):
@@ -41,15 +208,25 @@ class BlochSphereGUI:
 
         control_frame = Frame(control_canvas)
         control_window = control_canvas.create_window((0, 0), window=control_frame, anchor='nw')
+        self.control_window = control_window
 
-        # Keep the canvas scrollregion up to date when the inner frame changes
+        # Keep the canvas scrollregion up to date when the inner frame changes.
+        # Also stretch the embedded frame to the canvas width so trough clicks
+        # land on the sliders instead of the canvas behind them.
         def _on_control_config(event):
             control_canvas.configure(scrollregion=control_canvas.bbox("all"))
         control_frame.bind("<Configure>", _on_control_config)
+
+        def _on_canvas_configure(event):
+            if event.width > 1:
+                control_canvas.itemconfig(control_window, width=event.width)
+        control_canvas.bind("<Configure>", _on_canvas_configure)
         
         # Mouse wheel support: bind when cursor is over the control canvas
         def _on_mousewheel(event):
-            # X11 uses Button-4/5, modern tk on Windows uses delta
+            # X11 uses Button-4/5, modern tk on Windows uses delta.
+            # Button-1 trough clicks are handled on the scales themselves so
+            # this scroll binding cannot swallow a drag.
             try:
                 if hasattr(event, 'num') and event.num in (4,):
                     control_canvas.yview_scroll(-1, 'units')
@@ -132,6 +309,15 @@ class BlochSphereGUI:
         self.entry_z.pack(side=tk.LEFT, padx=(5, 0))
         self.label_z = Label(control_frame, text="nz = 0.00 (0 to 2)", font=("Arial", 9))
         self.label_z.pack(anchor=tk.W)
+
+        # Trough clicks and drags must move the handle. Inside a canvas window
+        # item, Tk's default trough behavior only steps by `resolution` (0.01,
+        # about one pixel here) and does not drag unless the press starts on
+        # the slider element. That reads as a dead slider, especially once the
+        # CUDA-Q callback is slow enough to cancel auto-repeat.
+        self._enable_slider_interaction(self.slider_x)
+        self._enable_slider_interaction(self.slider_y)
+        self._enable_slider_interaction(self.slider_z)
         
         # Apply Angles button
         apply_angles_button = tk.Button(control_frame, text="Apply Angles", command=self.apply_angles)
@@ -145,7 +331,9 @@ class BlochSphereGUI:
         info_frame.pack(fill=tk.BOTH, expand=True, pady=20)
         
         Label(info_frame, text="State Information", font=("Arial", 11, "bold")).pack(anchor=tk.W)
-        self.state_text = tk.Text(info_frame, height=6, width=40, font=("Courier", 9))
+        # Tall enough for the state vector plus Bloch x, y, and z. Height is
+        # refit to the text after every update so the last coordinates stay visible.
+        self.state_text = tk.Text(info_frame, height=10, width=40, font=("Courier", 9))
         self.state_text.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # State vector input section
@@ -199,25 +387,83 @@ class BlochSphereGUI:
         self.state_vector_plot = None
         self.state_tip_plot = None
         self.last_tip = (0.0, 0.0, 1.0)
+        self._evolution_backend = None
+        self.cudaq_target = select_cudaq_target()
+        self._cudaq_ready = self.cudaq_target is not None
         
         # Initial state
         self.update_state()
     
+    def _enable_slider_interaction(self, scale):
+        """Make a rotation slider jump to trough clicks and follow drags.
+
+        Widget bindings run before the Scale class bindings and before
+        ``bind_all`` canvas scrolling. Returning ``"break"`` keeps those
+        handlers from stepping by one resolution tick or scrolling the panel
+        instead of moving the handle. ``grab_set`` keeps the drag alive if
+        the pointer slides off the thin trough.
+        """
+
+        def _move(event):
+            try:
+                raw = scale.tk.call(scale._w, "get", event.x, event.y)
+                scale.set(float(raw))
+            except tk.TclError:
+                return "break"
+            except Exception:
+                return "break"
+            return "break"
+
+        def _press(event):
+            try:
+                scale.focus_set()
+                scale.grab_set()
+            except tk.TclError:
+                pass
+            return _move(event)
+
+        def _release(event):
+            try:
+                scale.grab_release()
+            except tk.TclError:
+                pass
+            return _move(event)
+
+        scale.bind("<Button-1>", _press)
+        scale.bind("<B1-Motion>", _move)
+        scale.bind("<ButtonRelease-1>", _release)
+
+    def _set_slider_value(self, scale, value):
+        """Set a scale without running its command callback."""
+        command = scale.cget("command")
+        scale.configure(command="")
+        try:
+            scale.set(value)
+        finally:
+            if command:
+                scale.configure(command=command)
+
     def get_state_vector(self, nx, ny, nz):
         """
         Compute the state vector after applying RX, RY, RZ rotations to |0⟩ state.
         Rotations are applied in order: RX(nx*π), RY(ny*π), RZ(nz*π)
         """
-        @cudaq.kernel
-        def rotated_state():
-            qubit = cudaq.qubit()
-            # Apply rotations in order: X, Y, Z
-            rx(nx * np.pi, qubit)
-            ry(ny * np.pi, qubit)
-            rz(nz * np.pi, qubit)
-        
-        state = cudaq.get_state(rotated_state)
-        return state
+        if self._cudaq_ready and cudaq is not None:
+            try:
+                @cudaq.kernel
+                def rotated_state():
+                    qubit = cudaq.qubit()
+                    # Apply rotations in order: X, Y, Z
+                    rx(nx * np.pi, qubit)
+                    ry(ny * np.pi, qubit)
+                    rz(nz * np.pi, qubit)
+
+                self._evolution_backend = "cudaq"
+                return cudaq.get_state(rotated_state)
+            except Exception:
+                self._cudaq_ready = False
+        self._evolution_backend = "numpy"
+        return state_from_slider_angles(nx, ny, nz)
 
     def get_current_state_array(self):
         """Return current state as numpy array [a0, a1].
@@ -259,16 +505,213 @@ class BlochSphereGUI:
         sign = '+' if im >= 0 else '-'
         return f"({re:.{prec}f}{sign}{abs(im):.{prec}f}j)"
 
-    def _decompose_su2_to_euler(self, U):
-        """Given a 2x2 SU(2) matrix U, return Euler angles (alpha, beta, gamma)
-        in radians such that
+    def _clear_error_labels(self):
+        """Drop red validation messages after a successful operation."""
+        self.state_error_label.config(text="")
+        self.angles_error_label.config(text="")
 
-            U = Rz(gamma) @ Ry(beta) @ Rx(alpha)
+    def _set_state_info(self, content):
+        """Replace the state-information text and grow it to fit every line.
 
-        The input is assumed to have det(U)=1.  We extract the quaternion
-        as in `update_sliders_from_state` and then compute the SO(3) matrix
-        and pull the Z-Y-X angles.
+        The Bloch y and z rows sit at the bottom of the block. A fixed
+        six-line widget clips them, so the height tracks the displayed text.
         """
+        if not content.endswith("\n"):
+            content += "\n"
+        self.state_text.delete("1.0", tk.END)
+        self.state_text.insert(tk.END, content)
+        width = max(1, int(float(self.state_text.cget("width"))))
+        visual = 0
+        for line in content.splitlines():
+            visual += max(1, (len(line) + width - 1) // width)
+        last_line = int(float(self.state_text.index("end-1c").split(".")[0]))
+        # One spare row keeps the last coordinate clear of the text border.
+        self.state_text.configure(height=max(visual, last_line) + 1)
+        try:
+            self.state_text.see("1.0")
+        except tk.TclError:
+            pass
+
+    def _state_for_gate(self):
+        """Current state for a gate.
+
+        Explicit a0 and a1 entries win when both are filled. Invalid or zero
+        entries set the state error label and return None. Empty entries use
+        the slider angles (a CUDA-Q kernel when that target is available).
+        """
+        a0_s = self.entry_a0.get().strip()
+        a1_s = self.entry_a1.get().strip()
+        if a0_s != "" and a1_s != "":
+            try:
+                state = np.array([complex(a0_s), complex(a1_s)], dtype=complex)
+            except Exception:
+                self.state_error_label.config(text="Invalid complex numbers in entries")
+                return None
+            norm = np.linalg.norm(state)
+            if norm < 1e-12:
+                self.state_error_label.config(text="State vector cannot be zero")
+                return None
+            return state / norm
+        return self._state_from_sliders()
+
+    def _state_from_sliders(self):
+        try:
+            state = self.get_state_vector(
+                self.slider_x.get(), self.slider_y.get(), self.slider_z.get()
+            )
+            arr = np.array(state, dtype=complex)
+            norm = np.linalg.norm(arr)
+            if norm < 1e-12:
+                raise ValueError("zero state")
+            return arr / norm
+        except Exception:
+            return np.array([1.0 + 0j, 0.0 + 0j], dtype=complex)
+
+    def _haar_unitary(self):
+        """Random 2×2 unitary from the Haar measure (via QR)."""
+        A = np.random.randn(2, 2) + 1j * np.random.randn(2, 2)
+        Q, R = np.linalg.qr(A)
+        diag = np.diag(R)
+        lam = np.empty(2, dtype=complex)
+        for i, value in enumerate(diag):
+            if abs(value) < 1e-12:
+                lam[i] = 1.0 + 0j
+            else:
+                lam[i] = value / abs(value)
+        return Q * lam
+
+    def _apply_matrix_numpy(self, state, unitary):
+        new_state = np.asarray(unitary, dtype=complex) @ np.asarray(state, dtype=complex)
+        norm = np.linalg.norm(new_state)
+        if norm > 1e-12:
+            new_state = new_state / norm
+        return new_state
+
+    def _apply_matrix_cudaq(self, state, unitary):
+        """Apply a 2×2 unitary with a CUDA-Q kernel initialized from ``state``."""
+        if not self._cudaq_ready or cudaq is None:
+            raise RuntimeError("CUDA-Q unavailable")
+        matrix = np.asarray(unitary, dtype=complex)
+        cudaq.register_operation(_CUDAQ_CUSTOM_GATE, matrix)
+        a0 = complex(state[0])
+        a1 = complex(state[1])
+
+        @cudaq.kernel
+        def kernel():
+            q = cudaq.qvector([a0, a1])
+            bloch_apply_unitary(q)
+
+        return np.array(cudaq.get_state(kernel), dtype=complex)
+
+    def _apply_reset_cudaq(self, state):
+        """Reset via a CUDA-Q kernel and return canonical |0⟩.
+
+        ``reset`` on a state-initialized qubit can keep a global phase.
+        The displayed amplitudes are the canonical |0⟩ vector.
+        """
+        if not self._cudaq_ready or cudaq is None:
+            raise RuntimeError("CUDA-Q unavailable")
+        a0 = complex(state[0])
+        a1 = complex(state[1])
+
+        @cudaq.kernel
+        def kernel():
+            q = cudaq.qvector([a0, a1])
+            reset(q)
+
+        result = np.array(cudaq.get_state(kernel), dtype=complex)
+        norm = np.linalg.norm(result)
+        if norm < 1e-8:
+            raise RuntimeError("CUDA-Q reset returned an empty state")
+        result = result / norm
+        if abs(result[1]) > 1e-6:
+            raise RuntimeError("CUDA-Q reset did not return |0>")
+        return np.array([1.0 + 0j, 0.0 + 0j], dtype=complex)
+
+    def _apply_named_cudaq(self, state, name):
+        """Apply one built-in gate with a CUDA-Q kernel starting from ``state``."""
+        if not self._cudaq_ready or cudaq is None:
+            raise RuntimeError("CUDA-Q unavailable")
+        a0 = complex(state[0])
+        a1 = complex(state[1])
+        name = name.upper()
+
+        if name == "H":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                h(q)
+        elif name == "X":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                x(q)
+        elif name == "Y":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                y(q)
+        elif name == "Z":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                z(q)
+        elif name == "S":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                s(q)
+        elif name == "T":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                t(q)
+        elif name == "RX90":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                rx(np.pi / 2, q)
+        elif name == "RY90":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                ry(np.pi / 2, q)
+        elif name == "RZ90":
+            @cudaq.kernel
+            def kernel():
+                q = cudaq.qvector([a0, a1])
+                rz(np.pi / 2, q)
+        else:
+            raise ValueError(f"No CUDA-Q kernel for gate {name}")
+
+        return np.array(cudaq.get_state(kernel), dtype=complex)
+
+    def _apply_named_numpy(self, state, name):
+        """NumPy fallback used only when a CUDA-Q kernel cannot run."""
+        name = name.upper()
+        if name == "RESET":
+            return np.array([1.0 + 0j, 0.0 + 0j], dtype=complex)
+        if name == "RANDOM":
+            return self._apply_matrix_numpy(state, self._haar_unitary())
+        gate = named_gate_matrix(name)
+        if gate is None:
+            return None
+        return self._apply_matrix_numpy(state, gate)
+
+    def _run_evolution(self, state, cudaq_fn, numpy_fn):
+        """Run ``cudaq_fn`` and fall back to ``numpy_fn`` if CUDA-Q cannot."""
+        if self._cudaq_ready and cudaq is not None:
+            try:
+                result = cudaq_fn()
+                self._evolution_backend = "cudaq"
+                return result
+            except Exception:
+                pass
+        result = numpy_fn()
+        if result is None:
+            return None
+        self._evolution_backend = "numpy"
+        return result
 
     def _finalize_state(self, new_state):
         """Common routine for displaying a new normalized state vector."""
@@ -281,6 +724,7 @@ class BlochSphereGUI:
         self.entry_a0.insert(0, self.format_complex(new_state[0], 6))
         self.entry_a1.delete(0, tk.END)
         self.entry_a1.insert(0, self.format_complex(new_state[1], 6))
+        self._clear_error_labels()
 
         # Sync sliders with the new state
         try:
@@ -289,15 +733,16 @@ class BlochSphereGUI:
             pass
 
         # Update state text and visualization
-        self.state_text.delete(1.0, tk.END)
-        self.state_text.insert(tk.END, "State Vector (after gate):\n")
-        self.state_text.insert(tk.END, f"|ψ⟩ = {self.format_complex(new_state[0],4)}|0⟩\n")
-        self.state_text.insert(tk.END, f"    + {self.format_complex(new_state[1],4)}|1⟩\n\n")
         x, y, z = self.state_to_bloch(new_state)
-        self.state_text.insert(tk.END, "Bloch Coordinates:\n")
-        self.state_text.insert(tk.END, f"x = {x:.4f}\n")
-        self.state_text.insert(tk.END, f"y = {y:.4f}\n")
-        self.state_text.insert(tk.END, f"z = {z:.4f}\n")
+        self._set_state_info(
+            "State Vector (after gate):\n"
+            f"|ψ⟩ = {self.format_complex(new_state[0],4)}|0⟩\n"
+            f"    + {self.format_complex(new_state[1],4)}|1⟩\n\n"
+            "Bloch Coordinates:\n"
+            f"x = {x:.4f}\n"
+            f"y = {y:.4f}\n"
+            f"z = {z:.4f}\n"
+        )
 
         self.last_tip = (x, y, z)
         self.draw_bloch_sphere(x, y, z)
@@ -307,64 +752,35 @@ class BlochSphereGUI:
             pass
 
     def apply_unitary(self, G):
-        """Apply unitary G (2x2) to current state and update UI.
+        """Apply unitary G (2x2) to the current state and update the UI.
 
-        The implementation always uses a CUDA-Q kernel: first the kernel
-        prepares the current state from the slider angles, then it applies
-        the decomposition of G as rx/ry/rz.  After execution we read back the
-        state vector and update the GUI accordingly.  This ensures every
-        evolution runs through CUDA-Q (even when the state was entered
-        explicitly).
+        The state is initialized inside a CUDA-Q kernel (from the amplitude
+        entries when they are filled, otherwise from the slider angles) and
+        G is applied in that kernel. NumPy is used only when CUDA-Q cannot run.
         """
-        # make sure sliders reflect the current state (entries may have changed)
-        try:
-            arr = self.get_current_state_array()
-            self.update_sliders_from_state(arr)
-        except Exception:
-            pass
-
-        nx = self.slider_x.get()
-        ny = self.slider_y.get()
-        nz = self.slider_z.get()
-
-        # decompose G into Z-Y-X Euler angles
-        try:
-            alpha, beta, gamma = self._decompose_su2_to_euler(G)
-        except Exception:
-            # fallback to numpy multiplication
-            state = self.get_current_state_array()
-            new_state = G @ state
-            norm = np.linalg.norm(new_state)
-            if norm > 1e-12:
-                new_state = new_state / norm
-            self._finalize_state(new_state)
+        state = self._state_for_gate()
+        if state is None:
             return
+        G = np.asarray(G, dtype=complex)
 
-        @cudaq.kernel
-        def unitary_kernel():
-            q = cudaq.qubit()
-            # prepare from sliders
-            rx(nx * np.pi, q)
-            ry(ny * np.pi, q)
-            rz(nz * np.pi, q)
-            # apply G via Euler decomposition
-            rx(alpha, q)
-            ry(beta, q)
-            rz(gamma, q)
+        def _cudaq_apply():
+            return self._apply_matrix_cudaq(state, G)
+
+        def _numpy_apply():
+            return self._apply_matrix_numpy(state, G)
 
         try:
-            state = cudaq.get_state(unitary_kernel)
-            new_state = np.array(state, dtype=complex)
-            self._finalize_state(new_state)
+            new_state = self._run_evolution(state, _cudaq_apply, _numpy_apply)
         except Exception as ex:
-            # fallback if kernel errors
-            self.state_error_label.config(text=f"CUDA-Q error: {ex}")
-            state = self.get_current_state_array()
-            new_state = G @ state
-            norm = np.linalg.norm(new_state)
-            if norm > 1e-12:
-                new_state = new_state / norm
-            self._finalize_state(new_state)
+            self.state_error_label.config(text=str(ex))
+            return
+        if new_state is None:
+            return
+        backend = self._evolution_backend
+        self._finalize_state(new_state)
+        # Slider sync inside finalize also runs a kernel. Keep the backend
+        # that actually applied this unitary.
+        self._evolution_backend = backend
 
     def open_arbitrary_rotation_dialog(self):
         """Open a dialog letting the user choose an axis (X/Y/Z/Custom) and angle (multiples of π)."""
@@ -435,147 +851,48 @@ class BlochSphereGUI:
         apply_btn.grid(row=3, column=0, columnspan=2, pady=(8,10))
 
     def apply_named_gate(self, name: str):
-        """Apply a named single-qubit gate to the current state and update UI.
-        Behavior:
-        - If the user has provided explicit `a0` and `a1` entries, apply the gate via NumPy (direct on that state).
-        - Otherwise (no explicit entries) compute the state using the current sliders via a CUDA-Q kernel, apply the gate in the kernel, and read back the state via `cudaq.get_state`.
-        This keeps CUDA-Q usage for slider-based simulation while preserving typed-state behavior.
+        """Apply a named single-qubit gate and update the UI.
+
+        The current state (amplitude entries when both are filled, otherwise
+        the slider angles) is loaded into a CUDA-Q kernel and the gate runs
+        there. Reset always returns |0⟩ and refills the amplitude boxes.
+        NumPy is used only when CUDA-Q is unavailable or the kernel fails.
         """
         name = name.upper()
+        if name not in ("RESET", "RANDOM") and named_gate_matrix(name) is None:
+            return
 
-        # Check whether user provided explicit state entries
-        a0_s = self.entry_a0.get().strip()
-        a1_s = self.entry_a1.get().strip()
-        use_entries = (a0_s != "" and a1_s != "")
+        state = self._state_for_gate()
+        if state is None:
+            return
 
-        # NOTE: this helper is now a method defined below as `_finalize_state`.
-        # Helper: finalize and display a new_state (numpy array)
-        def finalize_state(new_state):
-            self._finalize_state(new_state)
-
-        # If the user provided a typed state, apply gate via NumPy
-        if use_entries:
-            try:
-                a0 = complex(a0_s)
-                a1 = complex(a1_s)
-                state = np.array([a0, a1], dtype=complex)
-                norm = np.linalg.norm(state)
-                if norm < 1e-12:
-                    self.state_error_label.config(text="State vector cannot be zero")
-                    return
-                state = state / norm
-            except Exception:
-                self.state_error_label.config(text="Invalid complex numbers in entries")
-                return
-
-            # Build NumPy gates for typed-state path
-            X = np.array([[0, 1], [1, 0]], dtype=complex)
-            Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
-            Z = np.array([[1, 0], [0, -1]], dtype=complex)
-            H = (1.0 / np.sqrt(2.0)) * np.array([[1, 1], [1, -1]], dtype=complex)
-            S = np.array([[1, 0], [0, 1j]], dtype=complex)
-            T = np.array([[1, 0], [0, np.exp(1j * np.pi / 4)]], dtype=complex)
-            RX90 = np.array([[np.cos(np.pi/4), -1j*np.sin(np.pi/4)], [-1j*np.sin(np.pi/4), np.cos(np.pi/4)]], dtype=complex)
-            RY90 = np.array([[np.cos(np.pi/4), -np.sin(np.pi/4)], [np.sin(np.pi/4), np.cos(np.pi/4)]], dtype=complex)
-            RZ90 = np.array([[np.exp(-1j*np.pi/4), 0], [0, np.exp(1j*np.pi/4)]], dtype=complex)
-
+        def _cudaq_apply():
             if name == "RESET":
-                new_state = np.array([1.0+0j, 0.0+0j], dtype=complex)
-            elif name == "RANDOM":
-                A = (np.random.randn(2,2) + 1j * np.random.randn(2,2))
-                Q, R = np.linalg.qr(A)
-                lam = np.diag(R) / np.abs(np.diag(R))
-                U = Q * lam
-                new_state = U @ state
-            else:
-                G = {
-                    "H": H, "X": X, "Y": Y, "Z": Z,
-                    "S": S, "T": T,
-                    "RX90": RX90, "RY90": RY90, "RZ90": RZ90
-                }.get(name, None)
-                if G is None:
-                    return
-                new_state = G @ state
+                return self._apply_reset_cudaq(state)
+            if name == "RANDOM":
+                return self._apply_matrix_cudaq(state, self._haar_unitary())
+            return self._apply_named_cudaq(state, name)
 
-            finalize_state(new_state)
-            return
-
-        # Otherwise use CUDA-Q kernel path: compute state from sliders then apply gate in kernel
-        nx = self.slider_x.get()
-        ny = self.slider_y.get()
-        nz = self.slider_z.get()
-
-        # For RANDOM we fallback to NumPy as constructing arbitrary unitary in-kernel is more involved
-        if name == "RANDOM":
-            A = (np.random.randn(2,2) + 1j * np.random.randn(2,2))
-            Q, R = np.linalg.qr(A)
-            lam = np.diag(R) / np.abs(np.diag(R))
-            U = Q * lam
-            new_state = U @ np.array(self.get_state_vector(nx, ny, nz), dtype=complex)
-            finalize_state(new_state)
-            return
-
-        # Build kernel dynamically to apply rotations then the chosen gate
-        @cudaq.kernel
-        def gate_kernel():
-            q = cudaq.qubit()
-            rx(nx * np.pi, q)
-            ry(ny * np.pi, q)
-            rz(nz * np.pi, q)
-            # apply chosen gate
-            if name == "H":
-                h(q)
-            elif name == "X":
-                x(q)
-            elif name == "Y":
-                y(q)
-            elif name == "Z":
-                z(q)
-            elif name == "S":
-                s(q)
-            elif name == "T":
-                t(q)
-            elif name == "RX90":
-                rx(0.5 * np.pi, q)
-            elif name == "RY90":
-                ry(0.5 * np.pi, q)
-            elif name == "RZ90":
-                rz(0.5 * np.pi, q)
-            elif name == "RESET":
-                # no-op, already in rotated state
-                pass
+        def _numpy_apply():
+            return self._apply_named_numpy(state, name)
 
         try:
-            state = cudaq.get_state(gate_kernel)
-            new_state = np.array(state, dtype=complex)
-            finalize_state(new_state)
+            new_state = self._run_evolution(state, _cudaq_apply, _numpy_apply)
         except Exception as ex:
-            # If CUDA-Q call fails, fallback to numpy and show error
-            self.state_error_label.config(text=f"CUDA-Q error: {ex}")
+            self.state_error_label.config(text=str(ex))
             return
+        if new_state is None:
+            return
+        backend = self._evolution_backend
+        self._finalize_state(new_state)
+        self._evolution_backend = backend
     
     def state_to_bloch(self, state):
         """
         Convert a single-qubit state to Bloch sphere coordinates.
         state is a numpy array [a0, a1] representing a0|0⟩ + a1|1⟩
         """
-        # Normalize state
-        state = state / np.linalg.norm(state)
-        
-        # Extract amplitudes
-        a0 = state[0]
-        a1 = state[1]
-        
-        # Bloch vector components
-        # x = <σ_x> = 2*Re(a0* a1)
-        # y = <σ_y> = 2*Im(a0* a1)
-        # z = <σ_z> = |a0|² - |a1|²
-        
-        x = 2 * np.real(np.conj(a0) * a1)
-        y = 2 * np.imag(np.conj(a0) * a1)
-        z = np.abs(a0)**2 - np.abs(a1)**2
-        
-        return x, y, z
+        return bloch_coordinates(state)
 
     def update_sliders_from_state(self, state):
         """Estimate RX/RY/RZ angles (in slider units where value*pi is angle)
@@ -718,11 +1035,14 @@ class BlochSphereGUI:
                 except Exception:
                     pass
 
-            # Apply to sliders and entry fields
+            # Apply to sliders and entry fields. Silence the scale command so
+            # the idle redraw does not replace the state text the caller just
+            # computed (slider.set schedules that callback, and the rebuilt
+            # angles can differ by a global phase).
             try:
-                self.slider_x.set(nx_val)
-                self.slider_y.set(ny_val)
-                self.slider_z.set(nz_val)
+                self._set_slider_value(self.slider_x, nx_val)
+                self._set_slider_value(self.slider_y, ny_val)
+                self._set_slider_value(self.slider_z, nz_val)
             except Exception:
                 pass
 
@@ -850,38 +1170,34 @@ class BlochSphereGUI:
         self.label_y.config(text=f"ny = {ny:.2f} (0 to 2)")
         self.label_z.config(text=f"nz = {nz:.2f} (0 to 2)")
         
-        # Clear any state vector error message
-        self.state_error_label.config(text="")
-        
         # Compute state vector
         try:
             state = self.get_state_vector(nx, ny, nz)
             state_array = np.array(state)
             
-            # Update state text display
-            self.state_text.delete(1.0, tk.END)
-            self.state_text.insert(tk.END, "State Vector:\n")
-            self.state_text.insert(tk.END, f"|ψ⟩ = {self.format_complex(state_array[0],4)}|0⟩\n")
-            self.state_text.insert(tk.END, f"    + {self.format_complex(state_array[1],4)}|1⟩\n\n")
-            
             # Extract Bloch coordinates
             x, y, z = self.state_to_bloch(state_array)
             # remember last tip for other actions
             self.last_tip = (x, y, z)
-            
-            self.state_text.insert(tk.END, "Bloch Coordinates:\n")
-            self.state_text.insert(tk.END, f"x = {x:.4f}\n")
-            self.state_text.insert(tk.END, f"y = {y:.4f}\n")
-            self.state_text.insert(tk.END, f"z = {z:.4f}\n")
+
+            self._set_state_info(
+                "State Vector:\n"
+                f"|ψ⟩ = {self.format_complex(state_array[0],4)}|0⟩\n"
+                f"    + {self.format_complex(state_array[1],4)}|1⟩\n\n"
+                "Bloch Coordinates:\n"
+                f"x = {x:.4f}\n"
+                f"y = {y:.4f}\n"
+                f"z = {z:.4f}\n"
+            )
             
             # Draw Bloch sphere
             self.draw_bloch_sphere(x, y, z)
+            self._clear_error_labels()
             
             return
             
         except Exception as e:
-            self.state_text.delete(1.0, tk.END)
-            self.state_text.insert(tk.END, f"Error: {str(e)}")
+            self._set_state_info(f"Error: {str(e)}")
     
     def apply_angles(self):
         """Apply user-entered rotation angles"""
@@ -913,8 +1229,7 @@ class BlochSphereGUI:
             self.entry_a1.delete(0, tk.END)
             self.entry_a1.insert(0, "")
             
-            self.angles_error_label.config(text="")
-            self.state_error_label.config(text="")
+            self._clear_error_labels()
             
             # Trigger state update
             self.update_state()
@@ -960,21 +1275,20 @@ class BlochSphereGUI:
             except Exception:
                 pass
             
-            # Update state text display
-            self.state_text.delete(1.0, tk.END)
-            self.state_text.insert(tk.END, "State Vector (from input):\n")
-            self.state_text.insert(tk.END, f"|ψ⟩ = {self.format_complex(state_array[0],4)}|0⟩\n")
-            self.state_text.insert(tk.END, f"    + {self.format_complex(state_array[1],4)}|1⟩\n\n")
-            
             # Extract Bloch coordinates
             x, y, z = self.state_to_bloch(state_array)
             # remember last tip
             self.last_tip = (x, y, z)
-            
-            self.state_text.insert(tk.END, "Bloch Coordinates:\n")
-            self.state_text.insert(tk.END, f"x = {x:.4f}\n")
-            self.state_text.insert(tk.END, f"y = {y:.4f}\n")
-            self.state_text.insert(tk.END, f"z = {z:.4f}\n")
+
+            self._set_state_info(
+                "State Vector (from input):\n"
+                f"|ψ⟩ = {self.format_complex(state_array[0],4)}|0⟩\n"
+                f"    + {self.format_complex(state_array[1],4)}|1⟩\n\n"
+                "Bloch Coordinates:\n"
+                f"x = {x:.4f}\n"
+                f"y = {y:.4f}\n"
+                f"z = {z:.4f}\n"
+            )
             
             # Draw Bloch sphere
             self.draw_bloch_sphere(x, y, z)
@@ -983,8 +1297,7 @@ class BlochSphereGUI:
                 self.animate_tip_highlight(x, y, z)
             except Exception:
                 pass
-            self.state_error_label.config(text="")
-            self.angles_error_label.config(text="")
+            self._clear_error_labels()
             
         except ValueError as e:
             self.state_error_label.config(text=f"Invalid complex number format")
